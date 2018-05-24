@@ -3,6 +3,7 @@ import tensorflow as tf
 import pandas as pd
 from tensorflow.python.layers import core as layers_core
 import pdb
+import MeCab
 
 class Seq2Seq_tf:
     def __init__(self,hparams,sos_id,eos_id,padding_id):
@@ -114,6 +115,7 @@ class Seq2Seq_tf:
         #I/O　それぞれで一番長い文章の長さを取得する
         self.hparams.encoder_length = np.max([len(self.in_ind[i]) for i in np.arange(len(self.in_ind))]) + 1
         self.hparams.decoder_length = np.max([len(self.out_ind[i]) for i in np.arange(len(self.out_ind))]) + 1
+        #I/Oそれぞれを一番長い文章と同じ長さになるまでeos_id,padding_idを追加する
         for i in np.arange(len(self.in_ind)):
             str_length = len(self.in_ind[i])
             for ind in np.arange(len(self.in_ind[i]),self.hparams.encoder_length):
@@ -205,13 +207,35 @@ class Seq2Seq_tf:
         }
         replies = self.sess.run([translations],feed_dict=feed_dict)
         print(replies)
+        print(self.conv_w2i(replies[0],True))
         pdb.set_trace()
 
-   def read_dict(self,input_file):
+    def read_dict(self,input_file):
         f = open(input_file,'r')
         self.dict = f.read().split('\n')
         self.dict = np.delete(np.array(self.dict),np.where(np.array(self.dict)=='')).tolist()
         f.close()
+
+    def conv_w2i(self,input,flag):
+        if flag:
+            str_all = []
+            for i in input:
+                str_list = []
+                for ind in i:
+                    if ind == self.tgt_eos_id:
+                        break
+                    str_list.append(self.dict[i])
+                str_all.append(str_list)
+
+            return str_all
+        #else:
+            #入力された文字列を形態素に分解
+        #    mecab = MeCab.Tagger('-Ochasen')
+        #    str_list = mecab.parse(input).split('\n')
+        #    word = [x.split('\t')[0] for x in str_list]
+        #    str_length = len(word)
+            #形態素に分解した文字列をIDに変換
+        #    word_id = [np.where(self.dict == word[i]) for i in]
 
 if __name__ == "__main__":
     hparams=tf.contrib.training.HParams(
@@ -227,9 +251,9 @@ if __name__ == "__main__":
         beam_width = 9,
         use_attention = True,
     )
-
     s2s=Seq2Seq_tf(hparams,14521,14522,14523)
 
     s2s.makeData('test_data_ids_in.txt','test_data_ids_in.txt')
+    s2s.read_dict('vocab_in.txt')
     s2s.set_seq2seq()
     s2s.data_train(1000)

@@ -207,14 +207,20 @@ class Seq2Seq_tf:
         print(replies)
         pdb.set_trace()
 
+   def read_dict(self,input_file):
+        f = open(input_file,'r')
+        self.dict = f.read().split('\n')
+        self.dict = np.delete(np.array(self.dict),np.where(np.array(self.dict)=='')).tolist()
+        f.close()
+
 if __name__ == "__main__":
     hparams=tf.contrib.training.HParams(
         batch_size = 50,
         encoder_length = 5,
         decoder_length = 5,
-        num_units = 6,
+        num_units = 256,
         src_vocab_size = 14521,
-        embedding_size = 8,
+        embedding_size = 128,
         tgt_vocab_size = 14524,
         learning_rate = 0.01,
         max_gradient_norm = 5.0,

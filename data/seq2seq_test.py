@@ -224,7 +224,7 @@ class Seq2Seq_tf:
                 for ind in i:
                     if ind == self.tgt_eos_id:
                         break
-                    str_list.append(self.dict[i])
+                    str_list.append(self.dict[ind])
                 str_all.append(str_list)
 
             return str_all

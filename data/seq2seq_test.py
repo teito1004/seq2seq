@@ -23,7 +23,8 @@ class Seq2Seq_tf:
 
         encoder_emb_inputs = tf.nn.embedding_lookup(embedding_encoder,self.encoder_inputs)
 
-        encoder_cell = tf.nn.rnn_cell.BasicLSTMCell(self.hparams.num_units)
+        encoder_cell = [tf.nn.rnn_cell.BasicLSTMCell(n) for n in self.hparams.num_units]
+        encoder_cell = tf.nn.rnn_cell.MultiRNNCell(encoder_cell)
 
         encoder_outputs, encoder_state = tf.nn.dynamic_rnn(encoder_cell,encoder_emb_inputs,time_major=True,dtype=tf.float32)
 
@@ -41,7 +42,8 @@ class Seq2Seq_tf:
         #helper
         helper = tf.contrib.seq2seq.TrainingHelper(decoder_emb_inputs,self.decoder_lengths,time_major=True)
 
-        self.decoder_cell = tf.nn.rnn_cell.BasicLSTMCell(self.hparams.num_units)
+        self.decoder_cell = [tf.nn.rnn_cell.BasicLSTMCell(n) for n in self.hparams.num_units]
+        self.decoder_cell = tf.nn.rnn_cell.MultiRNNCell(self.decoder_cell)
 
         #Attention付きかどうか判断して、それぞれ適した動作を行う
         if self.hparams.use_attention:
@@ -173,7 +175,7 @@ class Seq2Seq_tf:
 
     def data_train(self,train_number):
         #学習メソッド
-        for i in range(train_number):
+        for i in range(train_number+1):
             encoder_data,decoder_label,decoder_data,mask = self.nextbatch()
             feed_dict = {
                 self.encoder_inputs:encoder_data,
@@ -242,14 +244,14 @@ if __name__ == "__main__":
         batch_size = 50,
         encoder_length = 5,
         decoder_length = 5,
-        num_units = 256,
-        src_vocab_size = 14521,
-        embedding_size = 128,
+        num_units = [5120,2560,256],
+        src_vocab_size = 14524,
+        embedding_size = 2048,
         tgt_vocab_size = 14524,
         learning_rate = 0.01,
         max_gradient_norm = 5.0,
         beam_width = 9,
-        use_attention = True,
+        use_attention = False,
     )
     s2s=Seq2Seq_tf(hparams,14521,14522,14523)
 

@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 from tensorflow.contrib.rnn import LSTMCell, LSTMStateTuple
 
 tf.reset_default_graph()
-sess = tf.InteractiveSession()
+sess = tf.InteractiveSession(config = tf.ConfigProto(allow_soft_placement=True))
 
 #------------------
 # パラメータの設定

@@ -133,10 +133,10 @@ decoder_outputs = decoder_outputs[:,:,:decoder_hidden_units]
 
 # decoder_outputsを、vocab_sizeのロジットに変換する線形変換の変数
 #decoder_logits = tf.contrib.layers.linear(decoder_outputs, vocab_size)
-W  =  tf.Variable(tf.random_uniform([decoder_hidden_units, vocab_size], -1, 1), dtype=tf.float32)
-b = tf.Variable(tf.zeros([vocab_size]), dtype=tf.float32)
-luong_W  =  tf.Variable(tf.random_uniform([decoder_hidden_units, encoder_hidden_units], -1, 1), dtype=tf.float32)
-context_W = tf.Variable(tf.random_uniform([1,encoder_hidden_units], -1, 1), dtype=tf.float32)
+W  =  tf.Variable(tf.random_uniform([1,decoder_hidden_units, vocab_size], -1, 1), dtype=tf.float32)
+#B = tf.Variable(tf.zeros([vocab_size]), dtype=tf.float32)
+luong_W  =  tf.Variable(tf.random_uniform([1,decoder_hidden_units,encoder_hidden_units], -1, 1), dtype=tf.float32)
+context_W = tf.Variable(tf.random_uniform([1,decoder_hidden_units,decoder_hidden_units*2], -1, 1), dtype=tf.float32)
 
 '''
 # EOSとPADのembedded vectorを用意。batch_size分
@@ -208,27 +208,54 @@ decoder_max_steps, decoder_batch_size, decoder_dim = tf.unstack(tf.shape(decoder
 
 #Luong_Attentionを用いてdecoder_outputsの状態を入れ替える。
 #result_outputs = tf.Variable(tf.zeros([decoder_max_steps, decoder_batch_size, decoder_hidden_units]),trainable=False,dtype = tf.float32)
-result_outputs = tf.placeholder(shape=(None,None,decoder_hidden_units),dtype=tf.float32,name='result_outputs')
-def luong_fn(step_time,result_outputs):
-    #pdb.set_trace()
-    luong_t = tf.matmul(tf.matmul(decoder_states[step_time,:,:],luong_W),encoder_states[step_time,:,:])
-    at_weight = tf.div(luong_t,tf.reduce_sum(luong_t))
-    ct_vec = encoder_states[step_time,:,:]*at_weight
-    at_vector = decoder_outputs[step_time,:,:] + (ct_vec*context_W)
-    step_time = step_time + 1
-    def true_fn(): return tf.expand_dims(at_vector,0)
-    def false_fn(): return tf.concat([result_outputs,tf.expand_dims(at_vector,0)],0)
-    return step_time,tf.cond(tf.equal(step_time,1),true_fn,false_fn)
-
-step_time = tf.constant(0)
-step_count = lambda step_time,result_outputs:tf.less(step_time,decoder_max_steps)
-
-_,result = tf.while_loop(step_count,luong_fn,loop_vars=[step_time,result_outputs])
+result_calc = tf.placeholder(shape=(None,None,None),dtype=tf.float32,name='result_calc')
+decoder_states_T = tf.transpose(decoder_states,perm=[1,0,2])
+encoder_states_T = tf.transpose(encoder_states,perm=[1,0,2])
+luong_W = tf.tile(luong_W,[decoder_batch_size,1,1])
+context_W = tf.tile(context_W,[decoder_batch_size,1,1])
+W = tf.tile(W,[decoder_max_steps,1,1])
 #pdb.set_trace()
 
+luong_score = tf.matmul(tf.matmul(decoder_states_T,luong_W),tf.transpose(encoder_states,perm=[1,2,0]))
+luong_atW = tf.div(tf.exp(luong_score),tf.reduce_sum(tf.exp(luong_score),2,keep_dims=True)+0.01)
+luong_ct = tf.matmul(luong_atW,encoder_states_T)
+luong_at_vec = tf.concat([tf.transpose(decoder_states_T,perm=[0,2,1]),tf.transpose(luong_ct,perm=[0,2,1])],1)
+luong_result = tf.matmul(context_W,luong_at_vec)
+'''
+def luong_fn(step_time,calc):
+    #luongAttentionのスコアを求めるためにhtを算出
+    pdb.set_trace()
+    luong_t = tf.matmul(decoder_states[step_time,:,:],luong_W)
+    #ループを用いてencoderのすべてのステップとのmatmulを算出
+    en_step = tf.constant(0)
+    def luong_mul(en_step,calc_mul):
+        pdb.set_trace()
+        def true_mul(): return tf.expand_dims(tf.matmul(tf.transpose(luong_t),encoder_states[en_step,:,:]),0)
+        def false_mul(): return tf.concat([calc_mul,tf.expand_dims(tf.matmul(tf.transpose(luong_t),encoder_states[en_step,:,:]),0)],0)
+        return en_step+1,tf.cond(tf.equal(en_step,0),true_mul,false_mul)
+    #luong_mulを使うための終了条件を作成
+    encoder_count = lambda en_step,calc_mul:tf.less(en_step,decoder_max_steps-1)
+    _,luong_score = tf.while_loop(encoder_count,luong_mul,loop_vars=[en_step,result_calc])
+    at_weight = tf.div(luong_score,tf.reduce_sum(luong_score,2,keep_dims=True))
+    pdb.set_trace()
+    ct_vec = tf.matmul(at_weight,encoder_states)
+    at_vector = decoder_outputs[step_time,:,:]+tf.matmul(ct_vec,context_W)
+    def true_fn(): return at_vector
+    def false_fn(): return tf.concat([calc,at_vector],0)
+    return step_time+1,tf.cond(tf.equal(step_time,0),true_fn,false_fn)
+
+step_time = tf.constant(0)
+step_count = lambda step_time,calc:tf.less(step_time,decoder_max_steps)
+_,result = tf.while_loop(step_count,luong_fn,loop_vars=[step_time,result_calc])
+#pdb.set_trace()
+'''
 # decoder_outputsを、(decoder_max_steps * decoder_batch_size) x docoder_dimにreshape
-decoder_outputs_flat = tf.reshape(result_outputs, (-1, decoder_dim))
-decoder_logits_flat = tf.add(tf.matmul(decoder_outputs_flat, W), b)
+#pdb.set_trace()
+#decoder_outputs_flat = tf.reshape(luong_result, (-1, decoder_hidden_units))
+decoder_outputs_flat=tf.transpose(luong_result,[2,0,1])
+context_W = tf.tile(context_W,[decoder_batch_size,1,1])
+#decoder_logits_flat = tf.add(tf.matmul(decoder_outputs_flat, W), B)
+decoder_logits_flat = tf.matmul(decoder_outputs_flat, W)
 decoder_logits = tf.reshape(decoder_logits_flat, (decoder_max_steps, decoder_batch_size, vocab_size))
 #------------------
 
@@ -292,22 +319,25 @@ def next_feed():
 		encoder_inputs_length: encoder_input_lengths_,
 		decoder_inputs: decoder_inputs_,
 		decoder_targets: decoder_targets_,
-        result_outputs:result_zeros
+        result_calc:result_zeros
 	}
 #------------------
 
 try:
 	for batch in range(max_batches):
-		#pdb.set_trace()
 		fd = next_feed()
-		#pdb.set_trace()
-		_, l = sess.run([train_op, loss], fd)
+		l_W,luong_s,luong_weight,_, l = sess.run([luong_W,luong_score,luong_atW,train_op, loss], fd)
 		loss_track.append(l)
 
 		if batch == 0 or batch % batches_in_epoch == 0:
 			print('batch {}'.format(batch))
 			print('  minibatch loss: {}'.format(sess.run(loss, fd)))
-
+			'''
+			print('  attention_W:{}'.format(l_W))
+			print('  attention_score:{}'.format(luong_s))
+			print('  attention_weight:{}'.format(luong_weight))
+			pdb.set_trace()
+			'''
 			predict_ = sess.run(decoder_prediction, fd)
 
 			for i, (inp, pred) in enumerate(zip(fd[encoder_inputs].T, predict_.T)):

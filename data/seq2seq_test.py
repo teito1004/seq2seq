@@ -4,6 +4,7 @@ import pandas as pd
 from tensorflow.python.layers import core as layers_core
 import pdb
 import MeCab
+import os
 
 class Seq2Seq_tf:
     def __init__(self,hparams,sos_id,eos_id,padding_id):
@@ -23,7 +24,7 @@ class Seq2Seq_tf:
 
         encoder_emb_inputs = tf.nn.embedding_lookup(embedding_encoder,self.encoder_inputs)
 
-        encoder_cell = [tf.nn.rnn_cell.BasicLSTMCell(n) for n in self.hparams.num_units]
+        encoder_cell = [tf.nn.rnn_cell.BasicLSTMCell(self.hparams.num_units) for i in range(self.hparams.num_layer)]
         encoder_cell = tf.nn.rnn_cell.MultiRNNCell(encoder_cell)
 
         encoder_outputs, encoder_state = tf.nn.dynamic_rnn(encoder_cell,encoder_emb_inputs,time_major=True,dtype=tf.float32)
@@ -42,7 +43,7 @@ class Seq2Seq_tf:
         #helper
         helper = tf.contrib.seq2seq.TrainingHelper(decoder_emb_inputs,self.decoder_lengths,time_major=True)
 
-        self.decoder_cell = [tf.nn.rnn_cell.BasicLSTMCell(n) for n in self.hparams.num_units]
+        self.decoder_cell = [tf.nn.rnn_cell.BasicLSTMCell(self.hparams.num_units) for i in range(self.hparams.num_layer)]
         self.decoder_cell = tf.nn.rnn_cell.MultiRNNCell(self.decoder_cell)
 
         #Attention付きかどうか判断して、それぞれ適した動作を行う
@@ -154,27 +155,33 @@ class Seq2Seq_tf:
             self.out_ind_mask.append(list(np.fix(x)))
 
         #ミニバッチ用のランダムインデックスを作成する
-        self.randInd_in = np.random.permutation(len(self.in_ind))
-        self.randInd_out = np.random.permutation(len(self.out_ind))
+        self.randInd = np.random.permutation(len(self.in_ind))
 
     def nextbatch(self):
         #makeDataにて作成したデータを切り分ける
         sInd = self.hparams.batch_size*self.batchcnt
         eInd = sInd + self.hparams.batch_size
 
-        in_batch = np.transpose(np.array(self.in_ind)[self.randInd_in[sInd:eInd]]).astype(int)
-        out_batch = np.array(self.out_ind)[self.randInd_out[sInd:eInd]].astype(int)
-        out_sos_batch = np.transpose(np.array(self.out_ind_sos)[self.randInd_out[sInd:eInd]]).astype(int)
-        out_mask_batch = np.array(self.out_ind_mask)[self.randInd_out[sInd:eInd]].astype(int)
+        in_batch = np.transpose(np.array(self.in_ind)[self.randInd[sInd:eInd]]).astype(int)
+        out_batch = np.array(self.out_ind)[self.randInd[sInd:eInd]].astype(int)
+        out_sos_batch = np.transpose(np.array(self.out_ind_sos)[self.randInd[sInd:eInd]]).astype(int)
+        out_mask_batch = np.array(self.out_ind_mask)[self.randInd[sInd:eInd]].astype(int)
 
         self.batchcnt += 1
-        #batchとして取得する範囲がデータ範囲を超えた場合はカウントを初期化する
+        #batchとして取得する範囲がデータ範囲を超えた場合はカウントを初期化してランダムインデックスを作り直す
         if (self.hparams.batch_size*self.batchcnt)+self.batchcnt > len(self.in_ind):
             self.batchcnt = 0
+            self.randInd = np.random.permutation(len(self.in_ind))
+
         return in_batch,out_batch,out_sos_batch,out_mask_batch
 
     def data_train(self,train_number):
         #学習メソッド
+        saver = tf.train.Saver()
+        model_path = './process'
+        if not os.path.isdir(model_path):
+            os.mkdir(model_path)
+
         for i in range(train_number+1):
             encoder_data,decoder_label,decoder_data,mask = self.nextbatch()
             feed_dict = {
@@ -188,6 +195,10 @@ class Seq2Seq_tf:
             if i%10==0:
                 print('iteration={} loss={}'.format(i,np.mean(loss_value)))
 
+            if i%100==0:
+                full_path = os.path.join(model_path,'model{}.ckpt'.format(i))
+                saver.save(self.sess,full_path)
+
         inference_helper = tf.contrib.seq2seq.GreedyEmbeddingHelper(
             self.embedding_decoder,
             tf.fill([self.hparams.batch_size],self.tgt_sos_id),
@@ -200,17 +211,17 @@ class Seq2Seq_tf:
         source_sequence_length = self.hparams.encoder_length
         maximum_iterations =tf.cast(tf.round(tf.reduce_max(source_sequence_length)*2),tf.int32)
 
-        outputs, _, _ = tf.contrib.seq2seq.dynamic_decode(
+        outputs,final_state,sequence_length = tf.contrib.seq2seq.dynamic_decode(
             inference_decoder,maximum_iterations=maximum_iterations)
         translations = outputs.sample_id
 
+        pdb.set_trace()
         feed_dict = {
             self.encoder_inputs:encoder_data,
         }
-        replies = self.sess.run([translations],feed_dict=feed_dict)
+        replies,state,length = self.sess.run([translations,final_state,sequence_length],feed_dict=feed_dict)
         print(replies)
         print(self.conv_w2i(replies[0],True))
-        pdb.set_trace()
 
     def read_dict(self,input_file):
         f = open(input_file,'r')
@@ -224,7 +235,7 @@ class Seq2Seq_tf:
             for i in input:
                 str_list = []
                 for ind in i:
-                    if ind == self.tgt_eos_id:
+                    if ind == self.tgt_eos_id or self.dict[ind]=='EOS':
                         break
                     str_list.append(self.dict[ind])
                 str_all.append(str_list)
@@ -244,18 +255,19 @@ if __name__ == "__main__":
         batch_size = 50,
         encoder_length = 5,
         decoder_length = 5,
-        num_units = [5120,2560,256],
+        num_units = 256,
+        num_layer = 4,
         src_vocab_size = 14524,
-        embedding_size = 2048,
+        embedding_size = 1024,
         tgt_vocab_size = 14524,
         learning_rate = 0.01,
-        max_gradient_norm = 5.0,
+        max_gradient_norm = 10.0,
         beam_width = 9,
         use_attention = False,
     )
     s2s=Seq2Seq_tf(hparams,14521,14522,14523)
 
-    s2s.makeData('test_data_ids_in.txt','test_data_ids_in.txt')
+    s2s.makeData('test_data_ids_in.txt','test_data_ids_out.txt')
     s2s.read_dict('vocab_in.txt')
     s2s.set_seq2seq()
-    s2s.data_train(1000)
+    s2s.data_train(10000)

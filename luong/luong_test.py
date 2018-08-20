@@ -6,6 +6,9 @@ import pdb
 import matplotlib.pyplot as plt
 from tensorflow.contrib.rnn import LSTMCell, LSTMStateTuple
 import pickle as pkl
+import pandas as pd
+import os
+import codecs
 
 #lstmcellをoutput,stateで結合した形で中間層をすべて保存できるように設定(state_is_tuple)を変えるクラス
 class CustomRNN(tf.contrib.rnn.LSTMCell):
@@ -29,7 +32,7 @@ EOS = 1
 
 vocab_size = 100
 #input_embedding_size = 200
-embedding_size = 200
+embedding_size = 1200
 
 encoder_hidden_units = 200
 decoder_hidden_units = encoder_hidden_units
@@ -110,6 +113,7 @@ W = tf.tile(W,[decoder_max_steps,1,1])
 
 #luongのAttention
 luong_score = tf.matmul(tf.matmul(decoder_states_T,luong_W),tf.transpose(encoder_states,perm=[1,2,0]))
+luong_e = luong_score - tf.reduce_max(luong_score,2,keep_dims=True)
 luong_atW = tf.div(tf.exp(luong_score),tf.reduce_sum(tf.exp(luong_score),2,keep_dims=True)+0.01)
 luong_ct = tf.matmul(luong_atW,encoder_states_T)
 luong_at_vec = tf.concat([tf.transpose(decoder_states_T,perm=[0,2,1]),tf.transpose(luong_ct,perm=[0,2,1])],1)
@@ -139,7 +143,6 @@ stepwise_cross_entropy = tf.nn.softmax_cross_entropy_with_logits(
 	labels=labels,
 	logits=decoder_logits,
 )
-
 loss = tf.reduce_mean(stepwise_cross_entropy)
 train_op = tf.train.AdamOptimizer().minimize(loss)
 #------------------
@@ -181,31 +184,110 @@ def next_feed():
 		decoder_targets: decoder_targets_,
 	}
 #------------------
+#文章用(dualencoder 拡張用)
+#------------------
+def set_data(data_path,dict_path):
+    #文章をidにするための辞書を読み込み
+    dict = pd.read_csv(dict_path,header=None)
+    #文章を読み込み
+    fn_list = os.listdir(data_path)
+    #del_str = ',.\n'
+    f_str_list=[]
+    for fn in fn_list:
+        line_list = []
+        fpath = os.path.join(data_path,fn)
+        fp = codecs.open(fpath,'r','utf-8','ignore')
+        for line in fp:
+            line_sp = line.split(' ')
+            line_sp = [st.strip(',.\n') for st in line_sp]
+            line_sp = np.delete(np.array(line_sp),np.where(pd.DataFrame(line_sp)=='')[0]).tolist()
+            line_list.append(line_sp)
+        f_str_list.append(line_list)
+        fp.close()
+
+    return dict,f_str_list[0],f_str_list[1],f_str_list[2],f_str_list[3]
+
+
+def next_feed_str(dict,in_text,out_text,max_length,index,count):
+    encoder_input_lengths_ = max_length
+    encoder_inputs_text = in_text[batch_size*count:batch_size*(count+1)]
+    decoder_inputs_text = out_text[batch_size*count:batch_size*(count+1)]
+    
+    encoder_lengths = np.array([len(t) for t in encoder_inputs_text])
+
+    encoder_inputs_ = []
+    for sentence in encoder_inputs_text:
+        line_ids = []
+        for t in range(encoder_input_lengths_):
+            if len(sentence) <= t:
+                line_ids.extend([0])
+            else:
+                line_ids.extend(np.where(dict == sentence[t])[0].tolist())
+        encoder_inputs_.append(line_ids)
+
+    encoder_inputs_array = np.array(encoder_inputs_).transpose()
+
+    decoder_inputs_ = []
+    decoder_targets_ = []
+    for sentence in decoder_inputs_text:
+        line_ids = []
+        line_ids_reverse = []
+        for t in range(encoder_input_lengths_+1):
+            if len(sentence) == t:
+                line_ids.extend([1])
+                line_ids_reverse = line_ids[::-1]
+            elif len(sentence) <= t:
+                line_ids.extend([0])
+                line_ids_reverse.extend([0])
+            else:
+                line_ids.extend(np.where(dict == sentence[t])[0].tolist())
+        decoder_inputs_.append(line_ids_reverse)
+        decoder_targets_.append(line_ids)
+
+    decoder_inputs_array = np.array(decoder_inputs_).transpose()
+    decoder_targets_array = np.array(decoder_targets_).transpose()
+    count = count + 1
+
+    if batch_size*(count+1) > len(in_text):
+        index = np.random.permutation(len(in_text))
+
+    return{
+        encoder_inputs:encoder_inputs_array,
+        encoder_inputs_length:encoder_lengths,
+        decoder_inputs:decoder_inputs_array,
+        decoder_targets:decoder_targets_array,
+    },index,count
+
+
+dict,train_out,train_in,test_out,test_in = set_data('data/cornell_corpus','data/dict.csv')
+
+train_randIndex = np.random.permutation(len(train_in))
+test_randIndex = np.random.permutation(len(test_in))
+train_lengths = np.max([np.max([len(t) for t in train_in]),np.max([len(t) for t in train_out])])
+test_lengths = np.max([np.max([len(t) for t in test_in]),np.max([len(t) for t in test_out])])
+train_batchcount = 0
+test_batchcount = 0
+vocab_size = dict.size
 
 try:
 	for batch in range(max_batches):
-		fd = next_feed()
-		l_W,luong_s,luong_weight,_, l = sess.run([luong_W,luong_score,luong_atW,train_op, loss], fd)
-		loss_track.append(l)
+                fd,train_randIndex,train_batchcount = next_feed_str(dict,train_in,train_out,train_lengths,train_randIndex,train_batchcount)
+                l_W,luong_s,luong_weight,_, l = sess.run([luong_W,luong_score,luong_atW,train_op, loss], fd)
+                loss_track.append(l)
 
-		if batch == 0 or batch % batches_in_epoch == 0:
-			print('batch {}'.format(batch))
-			print('  minibatch loss: {}'.format(sess.run(loss, fd)))
-			'''
-			print('  attention_W:{}'.format(l_W))
-			print('  attention_score:{}'.format(luong_s))
-			print('  attention_weight:{}'.format(luong_weight))
-			pdb.set_trace()
-			'''
-			predict_ = sess.run(decoder_prediction, fd)
+                if batch == 0 or batch % batches_in_epoch == 0:
+                    print('batch {}'.format(batch))
+                    print('  minibatch loss: {}'.format(sess.run(loss, fd)))
+                    #print('  minibatch label: {}'.format(sess.run(labels,fd)))
+                    predict_ = sess.run(decoder_prediction, fd)
 
-			for i, (inp, pred) in enumerate(zip(fd[encoder_inputs].T, predict_.T)):
-				print('  sample {}:'.format(i + 1))
-				print('	input	 > {}'.format(inp))
-				print('	predicted > {}'.format(pred))
-				if i >= 2:
-					break
-			print()
+                    for i, (inp, pred) in enumerate(zip(fd[encoder_inputs].T, predict_.T)):
+                        print('  sample {}:'.format(i + 1))
+                        print('	input	 > {}'.format(inp))
+                        print('	predicted > {}'.format(pred))
+                        if i >= 0:
+                            break
+                    print()
 
 except KeyboardInterrupt:
 	print('training interrupted')

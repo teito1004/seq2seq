@@ -10,6 +10,9 @@ import pandas as pd
 import os
 import codecs
 
+
+tf.reset_default_graph()
+sess = tf.InteractiveSession(config = tf.ConfigProto(allow_soft_placement=True))
 #lstmcellをoutput,stateで結合した形で中間層をすべて保存できるように設定(state_is_tuple)を変えるクラス
 class CustomRNN(tf.contrib.rnn.LSTMCell):
     def __init__(self, *args, **kwargs):
@@ -22,8 +25,15 @@ class CustomRNN(tf.contrib.rnn.LSTMCell):
         return next_state, next_state # return two copies of the state, instead of the output and the state
 
 
-tf.reset_default_graph()
-sess = tf.InteractiveSession(config = tf.ConfigProto(allow_soft_placement=True))
+def weight_variable(name, shape):
+	return tf.get_variable(name, shape, initializer=tf.random_normal_initializer(stddev=0.1))
+
+def bias_variable(name, shape):
+	return tf.get_variable(name, shape, initializer=tf.constant_initializer(0.1))
+
+def fc(inputs, w):
+	fc = tf.matmul(inputs, w)
+	return fc
 
 #------------------
 # パラメータの設定
@@ -34,8 +44,10 @@ vocab_size = 100
 #input_embedding_size = 200
 embedding_size = 1200
 
-encoder_hidden_units = 200
-decoder_hidden_units = encoder_hidden_units
+#h_dim = 200
+#h_dim = h_dim
+h_dim = 200
+
 
 loss_track = []
 max_batches = 10001
@@ -52,52 +64,201 @@ encoder_inputs_length = tf.placeholder(shape=(None,), dtype=tf.int32, name='enco
 # 単語IDをembeddedベクトルに変換
 # vocab_size × input_embedding_sizeの行列（ランダム）
 embeddings = tf.Variable(tf.random_uniform([vocab_size, embedding_size], -1.0, 1.0), dtype=tf.float32)
-
 # 文章の長さ　×　バッチサイズ　×　input_embedding_size（embeddedベクトルの次元）
 encoder_inputs_embedded = tf.nn.embedding_lookup(embeddings, encoder_inputs)
-#encoderのcell作成及びdynamic_rnnの実行
-with tf.variable_scope('encoder_fn') as scope:
-    encoder_cell = CustomRNN(encoder_hidden_units)
-    encoder_outputs, encoder_final_state = tf.nn.dynamic_rnn(
-        cell=encoder_cell,
-        dtype=tf.float32,
-        sequence_length=encoder_inputs_length,
-        inputs=encoder_inputs_embedded,
-    	time_major=True)
-#encoder_dynamic_rnnの中間層の出力をoutputとstateに切り分ける
-encoder_states = encoder_outputs[:,:,encoder_hidden_units:]
-encoder_outputs = encoder_outputs[:,:,:encoder_hidden_units]
-
-
-#------------------
-# デコーダ
-# decoder_inputs_embedded：デコーダの入力
-decoder_cell = CustomRNN(decoder_hidden_units)
-
 # decoderの文章の長さ
 decoder_inputs = tf.placeholder(shape=(None, None), dtype=tf.int32, name='decoder_inputs')
 decoder_lengths = encoder_inputs_length+1
 #decoderのembedding行列作成
 decoder_inputs_embedded = tf.nn.embedding_lookup(embeddings, decoder_inputs)
-#decoderのcell作成及びdynamic_rnnの実行
-with tf.variable_scope('decoder_fn') as scope:
-    decoder_cell = CustomRNN(decoder_hidden_units)
-    decoder_outputs, decoder_final_state = tf.nn.dynamic_rnn(
-    cell=decoder_cell,
-    initial_state=encoder_final_state,
-    dtype=tf.float32,
-    sequence_length=decoder_lengths,
-    inputs=decoder_inputs_embedded,
-	time_major=True)
-#decoder_dynamic_rnnの中間層の出力をoutputとstateに切り分ける
-decoder_states = decoder_outputs[:,:,decoder_hidden_units:]
-decoder_outputs = decoder_outputs[:,:,:decoder_hidden_units]
+
+is_decoder_input = tf.placeholder(tf.bool, name='is_decoder_input')
+
+#encoder
+def encoder(x,x_length,test = False,keep_prob=0.5):
+    with tf.variable_scope('encoder_fn') as scope:
+        if test:
+            scope.reuse_variables()
+
+        cell = CustomRNN(h_dim)
+        outputs_states, final_state = tf.nn.dynamic_rnn(
+            cell = cell,
+            dtype = tf.float32,
+            sequence_length = x_length,
+            inputs = x,
+        	time_major=True)
+    #encoder_dynamic_rnnの中間層の出力をoutputとstateに切り分ける
+    states = outputs_states[:,:,:h_dim]
+    outputs = outputs_states[:,:,h_dim:]
+
+    return states,final_state
+
+encoder_train_states,encoder_train_final_state = encoder(encoder_inputs_embedded,encoder_inputs_length,keep_prob=1)
+encoder_test_states,encoder_test_final_state = encoder(encoder_inputs_embedded,encoder_inputs_length,test=True,keep_prob=1)
+
+def decoder(encoder_final_state,encoder_states,test=False,keep_prob=0.5):
+    with tf.variable_scope('decoder_fn') as scope:
+        if test:
+            scope.reuse_variables()
+        #------------------
+        # デコーダ
+        # データ数の取得
+        _, data_size, _ = tf.unstack(tf.shape(encoder_states))
+
+        fcW = weight_variable("fcW", [1,h_dim, vocab_size])
+
+        Wa = weight_variable("Wa", [1,h_dim,h_dim])
+        Wc = weight_variable("Wc", [1,h_dim,h_dim*2])
+
+		#--------------------
+		# decoderの初期ステップ時の出力変換
+        def loop_fn_initial(initial_state):
+            initial_elements_finished = (0 >= encoder_inputs_length+1)  # all False at the initial step
+
+            initial_input = tf.ones([data_size, embedding_size]) * EOS
+            initial_cell_state = initial_state
+            initial_cell_output = None
+            initial_loop_state = None  # we don't need to pass any additional information
+            return (initial_elements_finished,
+                    initial_input,
+                    initial_cell_state,
+                    initial_cell_output,
+                    initial_loop_state)
+		#--------------------
+
+		#--------------------
+		# luong attention
+        def get_luong_output(decoder_states):
+
+			# time_majorから、データ数 x ステップ数 x h_dimに変換
+            decoder_states_T = tf.transpose(decoder_states,[1,0,2])
+            encoder_states_T = tf.transpose(encoder_states,[1,0,2])
+
+			# パラメータの奥行をdata_sizeに拡張
+            Was = tf.tile(Wa,[data_size,1,1])
+            Wcs = tf.tile(Wc,[data_size,1,1])
+
+			# スコアの計算（式8）
+            scores = tf.matmul(tf.matmul(decoder_states_T,Was), tf.transpose(encoder_states,[1,2,0]))
+
+			# align atの計算（式7）
+			#aligns = tf.div(tf.exp(scores),tf.reduce_sum(tf.exp(scores),2,keep_dims=True)+0.01)
+			# x-max(x):expのinfを回避するため
+            scores_minus_max = scores-tf.reduce_max(scores,axis=2,keep_dims=True)
+            aligns = tf.div(tf.exp(scores_minus_max),tf.reduce_sum(tf.exp(scores_minus_max),2,keep_dims=True)+0.01)
+
+			# コンテキストベクターctの計算
+            contexts = tf.matmul(aligns,encoder_states_T)
+
+			# コンテキストベクターとdecoderの状態を結合（式5）
+            context_decoder_states = tf.concat([tf.transpose(decoder_states_T,[0,2,1]),tf.transpose(contexts,[0,2,1])],1)
+
+			# luong attentionの出力（式5）
+            luong_outputs = tf.tanh(tf.matmul(Wcs,context_decoder_states))
+
+            return luong_outputs
+		#--------------------
+
+		#--------------------
+		# decoderの各ステップの出力変換
+        def loop_fn_transition(time, previous_output, previous_state, previous_loop_state):
+            def get_luong_output_loop():
+                previous_output_luong = get_luong_output(tf.expand_dims(previous_output[:,:h_dim],axis=0))
+                #previous_output_luong_info = tf.concat([previous_output_luong[:,:,0], info_inputs], axis=1)
+                return fc(previous_output_luong,tf.transpose(fcW,perm=[2,0,1]))
+                #return fc(previous_output_luong,fcW)
+
+			# 一つ前のステップの出力previous_outputを線形変換に変換
+            def get_next_input():
+                pdb.set_trace()
+                next_input = tf.stop_gradient(tf.cond(is_decoder_input,
+                            lambda:decoder_inputs_embedded[time-1],
+                            get_luong_output_loop)
+                            )
+
+                return next_input
+
+			# 現在のステップtimeがencoder_inputs_length+1以上か否か
+            elements_finished = (time >= encoder_inputs_length+1)
+
+			# batch_sizeのelements_finishedをANDを計算。
+            finished = tf.reduce_all(elements_finished)
+
+			# 終了している場合、PAD、終了していない場合1つ前の出力を線形変換したものを次の入力にする
+            pad_input = tf.ones([data_size, embedding_size]) * PAD
+            input = tf.cond(finished, lambda:pad_input, get_next_input)
+            state = previous_state		# hiddenはそのまま渡す
+            output = previous_output	# outputもそのまま渡す
+            loop_state = None			# loop_stateはNone
+
+            return (elements_finished,
+                    input,
+                    state,
+                    output,
+                    loop_state)
+		#--------------------
+
+		#--------------------
+		# 1ステップ目は、previous_outputがnoneのため、loop_fn_initial()を実行、2ステップ以降はloop_fn_transitionを実行
+        def loop_fn(time, previous_output, previous_state, previous_loop_state):
+            if previous_state is None:	# time == 0
+                assert previous_output is None and previous_state is None
+                return loop_fn_initial(encoder_final_state)
+            else:
+                return loop_fn_transition(time, previous_output, previous_state, previous_loop_state)
+
+				# decoder_inputs：デコーダの入力
+        # decoder_inputs_embedded：デコーダの入力
+        cell = CustomRNN(h_dim)
+
+        # 自作のloop_fnを用いたRNN
+        outputs_states_ta, final_state, _ = tf.nn.raw_rnn(cell, loop_fn)
+        outputs_states = outputs_states_ta.stack()
+
+		# 出力をoutputとstateに切り分ける
+        decoder_states = outputs_states[:,:,:h_dim]
+        decoder_outputs = outputs_states[:,:,h_dim:]
+		#----------------
+
+		# luong attention
+        outputs = get_luong_output(decoder_states)
+		# outputs_flat = tf.reshape(outputs, (-1, h_dim))
+
+		#----------------
+		# outputsを、time_majorから、(データ数 x ステップ数) x h_dimに変換
+        outputs_flat = tf.reshape(outputs, (-1, h_dim))
+        outputs_flat_info = tf.concat([outputs_flat, tf.reshape(tf.tile(info_inputs,[1,encoder_inputs_length+1]),[-1,len(infoInds)])], axis=1)
+
+		# fully connected network
+        logits_flat = fc(outputs_flat_info,fcW)
+
+		# time majorに戻す
+        logits = tf.reshape(logits_flat, (encoder_inputs_length+1, data_size, embedding_size))
+		#----------------
+        return logits
+#---------------------------
+
+#---------------------------
+# decoder
+decoder_train_logits = decoder(encoder_train_final_state, encoder_train_states, keep_prob=1.0)
+decoder_test_logits = decoder(encoder_test_final_state, encoder_test_states,test=True,keep_prob=1.0)
+'''
+        decoder_outputs, decoder_final_state = tf.nn.dynamic_rnn(
+        cell=decoder_cell,
+        initial_state=encoder_final_state,
+        dtype=tf.float32,
+        sequence_length=decoder_lengths,
+        inputs=decoder_inputs_embedded,
+    	time_major=True)
+        #decoder_dynamic_rnnの中間層の出力をoutputとstateに切り分ける
+        decoder_states = decoder_outputs[:,:,:h_dim]
+        decoder_outputs = decoder_outputs[:,:,h_dim:]
 
 # decoder_outputsを、vocab_sizeのロジットに変換する線形変換の変数定義
-W  =  tf.Variable(tf.random_uniform([1,decoder_hidden_units, vocab_size], -1, 1), dtype=tf.float32)
+W  =  tf.Variable(tf.random_uniform([1,h_dim, vocab_size], -1, 1), dtype=tf.float32)
 #luongのattentionで用いる変数定義
-luong_W  =  tf.Variable(tf.random_uniform([1,decoder_hidden_units,encoder_hidden_units], -1, 1), dtype=tf.float32)
-context_W = tf.Variable(tf.random_uniform([1,decoder_hidden_units,decoder_hidden_units*2], -1, 1), dtype=tf.float32)
+luong_W  =  tf.Variable(tf.random_uniform([1,h_dim,h_dim], -1, 1), dtype=tf.float32)
+context_W = tf.Variable(tf.random_uniform([1,h_dim,h_dim*2], -1, 1), dtype=tf.float32)
 
 # decoder_outputsの各次元の大きさ取得
 decoder_max_steps, decoder_batch_size, decoder_dim = tf.unstack(tf.shape(decoder_outputs))
@@ -125,10 +286,9 @@ decoder_outputs_flat=tf.transpose(luong_result,[2,0,1])
 decoder_logits_flat = tf.matmul(decoder_outputs_flat, W)
 decoder_logits = tf.reshape(decoder_logits_flat, (decoder_max_steps, decoder_batch_size, vocab_size))
 #------------------
-
+'''
 #------------------
 # 損失関数
-
 # デコーダの教師出力
 decoder_targets = tf.placeholder(shape=(None, None), dtype=tf.int32, name='decoder_targets')
 
@@ -139,12 +299,25 @@ decoder_prediction = tf.argmax(decoder_logits, 2)
 labels=tf.one_hot(decoder_targets, depth=vocab_size, dtype=tf.float32)
 
 # decoder_targetsとdecoder_predictionの交差エントロピー
-stepwise_cross_entropy = tf.nn.softmax_cross_entropy_with_logits(
+stepwise_cross_entropy_train = tf.nn.softmax_cross_entropy_with_logits(
 	labels=labels,
-	logits=decoder_logits,
+	logits=decoder_train_logits,
 )
-loss = tf.reduce_mean(stepwise_cross_entropy)
-train_op = tf.train.AdamOptimizer().minimize(loss)
+loss_train = tf.reduce_mean(stepwise_cross_entropy_train)
+
+stepwise_cross_entropy_test = tf.nn.softmax_cross_entropy_with_logits(
+	labels=labels,
+	logits=decoder_test_logits,
+)
+loss_test = tf.reduce_mean(stepwise_cross_entropy_test)
+
+#train_op = tf.train.AdamOptimizer().minimize(loss)
+optimizer = tf.train.AdamOptimizer()
+# 勾配のクリッピング
+gvs = optimizer.compute_gradients(loss_train)
+capped_gvs = [(tf.clip_by_value(grad, -1., 1.), var) for grad, var in gvs]
+train_op = optimizer.apply_gradients(capped_gvs)
+
 #------------------
 
 sess.run(tf.global_variables_initializer())
@@ -208,11 +381,11 @@ def set_data(data_path,dict_path):
     return dict,f_str_list[0],f_str_list[1],f_str_list[2],f_str_list[3]
 
 
-def next_feed_str(dict,in_text,out_text,max_length,index,count):
+def next_feed_str(dict,in_text,out_text,max_length,index,count,trainmode=1):
     encoder_input_lengths_ = max_length
     encoder_inputs_text = in_text[batch_size*count:batch_size*(count+1)]
     decoder_inputs_text = out_text[batch_size*count:batch_size*(count+1)]
-    
+
     encoder_lengths = np.array([len(t) for t in encoder_inputs_text])
 
     encoder_inputs_ = []
@@ -251,11 +424,17 @@ def next_feed_str(dict,in_text,out_text,max_length,index,count):
     if batch_size*(count+1) > len(in_text):
         index = np.random.permutation(len(in_text))
 
+    if trainMode == 1:
+        is_decoder_input_ = True
+    else :
+        is_decoder_input_ = False
+
     return{
         encoder_inputs:encoder_inputs_array,
         encoder_inputs_length:encoder_lengths,
         decoder_inputs:decoder_inputs_array,
         decoder_targets:decoder_targets_array,
+        is_decoder_input: is_decoder_input_
     },index,count
 
 
@@ -270,28 +449,35 @@ test_batchcount = 0
 vocab_size = dict.size
 
 try:
-	for batch in range(max_batches):
-                fd,train_randIndex,train_batchcount = next_feed_str(dict,train_in,train_out,train_lengths,train_randIndex,train_batchcount)
-                l_W,luong_s,luong_weight,_, l = sess.run([luong_W,luong_score,luong_atW,train_op, loss], fd)
-                loss_track.append(l)
+    for batch in range(max_batches):
+        if batch <= 5000:fd_train,train_randIndex,train_batchcount = next_feed_str(dict,train_in,train_out,train_lengths,train_randIndex,train_batchcount)
+        else:fd_train,train_randIndex,train_batchcount = next_feed_str(dict,train_in,train_out,train_lengths,train_randIndex,train_batchcount,trainMode=2)
 
-                if batch == 0 or batch % batches_in_epoch == 0:
-                    print('batch {}'.format(batch))
-                    print('  minibatch loss: {}'.format(sess.run(loss, fd)))
-                    #print('  minibatch label: {}'.format(sess.run(labels,fd)))
-                    predict_ = sess.run(decoder_prediction, fd)
+        _,loss_train_value,decoder_train_logits_values = sess.run([train_op, loss_train, decoder_train_logits], fd_train)
 
-                    for i, (inp, pred) in enumerate(zip(fd[encoder_inputs].T, predict_.T)):
-                        print('  sample {}:'.format(i + 1))
-                        print('	input	 > {}'.format(inp))
-                        print('	predicted > {}'.format(pred))
-                        if i >= 0:
-                            break
-                    print()
+        if batch == 0 or batch % batches_in_epoch == 0:
+            fd_test = next_feed_strnext_feed_str(dict,test_in,test_out,test_lengths,test_randIndex,test_batchcount,trainMode=2)
+            loss_test_value, decoder_test_logits_values = sess.run([loss_test, decoder_test_logits], fd_test)
+
+            print('batch {}'.format(batch))
+            print('train loss: {}'.format(loss_train_value))
+            print('test loss: {}'.format(loss_test_value))
+            predict_ = sess.run(decoder_prediction, fd_test)
+
+            for i, (inp, pred) in enumerate(zip(fd_test[encoder_inputs].T, predict_.T)):
+                #pdb.set_trace()
+                print('  sample {}:'.format(i + 1))
+                inp_str = np.array([dict[0][ind] for ind in inp.tolist() if ind > 1])
+                print('	input	 > {}'.format(inp_str))
+                pred_str = np.array([dict[0][ind] for ind in pred.tolist() if ind > 1])
+                print('	predicted > {}'.format(pred_str))
+                if i >= 0:
+                    break
+            print()
 
 except KeyboardInterrupt:
 	print('training interrupted')
 
-plt.plot(loss_track)
+#plt.plot(loss_track)
 print('loss {:.4f} after {} examples (batch_size={})'.format(loss_track[-1], len(loss_track)*batch_size, batch_size))
-plt.show()
+#plt.show()
